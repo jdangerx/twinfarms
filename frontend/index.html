@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Twinfarms Candidate Properties</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    body { font-family: system-ui, sans-serif; }
+    .panel {
+      position: absolute; top: 12px; right: 12px; z-index: 1000;
+      width: 360px; max-height: calc(100% - 24px); overflow: auto;
+      background: white; border-radius: 8px; box-shadow: 0 2px 12px #0003;
+      padding: 12px;
+    }
+    .panel h1 { font-size: 18px; margin: 0 0 8px; }
+    .panel h3 { font-size: 14px; margin: 14px 0 6px; }
+    .filters label { display: block; margin: 6px 0; }
+    .muted { color: #666; font-size: 12px; }
+    .detail { border-top: 1px solid #ddd; margin-top: 12px; padding-top: 12px; }
+    .member { border-left: 4px solid #ddd; padding-left: 8px; margin: 8px 0; }
+    .counterpart { border-left-color: #7b2cbf; }
+    .leaflet-popup-content { min-width: 260px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <aside class="panel">
+    <h1>Candidate properties</h1>
+    <div class="muted" id="count">Loading…</div>
+    <div class="filters">
+      <strong>Match type</strong>
+      <label><input type="checkbox" value="hyphen_address" checked> Hyphen address</label>
+      <label><input type="checkbox" value="touching_same_owner" checked> Touching same owner</label>
+      <label><input type="checkbox" value="close_same_owner" checked> Close same owner</label>
+    </div>
+    <div class="detail" id="detail">Click a parcel to inspect it.</div>
+  </aside>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const colors = {
+      hyphen_address: '#2a9d8f',
+      touching_same_owner: '#e76f51',
+      close_same_owner: '#4361ee'
+    };
+    const map = L.map('map').setView([39.952, -75.215], 14);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 20,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    let data;
+    let layer;
+    let selectedCandidateId = null;
+
+    const money = value => value == null ? '—' : '$' + Math.round(value).toLocaleString();
+    const sqft = value => value == null ? '—' : Math.round(value).toLocaleString() + ' sf';
+    const label = value => value || '—';
+
+    fetch('data/candidate-parcels.geojson')
+      .then(response => response.json())
+      .then(json => {
+        data = json;
+        render();
+      });
+
+    document.querySelectorAll('.filters input').forEach(input => {
+      input.addEventListener('change', render);
+    });
+
+    function activeTypes() {
+      return new Set([...document.querySelectorAll('.filters input:checked')].map(input => input.value));
+    }
+
+    function render() {
+      const types = activeTypes();
+      const filtered = {
+        type: 'FeatureCollection',
+        features: data.features.filter(feature => types.has(feature.properties.candidate_type))
+      };
+      if (layer) map.removeLayer(layer);
+      layer = L.geoJSON(filtered, {
+        style: feature => parcelStyle(feature),
+        onEachFeature: (feature, leafletLayer) => {
+          leafletLayer.on('click', () => selectFeature(feature));
+          leafletLayer.bindPopup(feature.properties.address);
+        }
+      }).addTo(map);
+      document.getElementById('count').textContent = `${filtered.features.length} parcels in ${new Set(filtered.features.map(f => f.properties.candidate_id)).size} candidates`;
+      if (filtered.features.length) map.fitBounds(layer.getBounds(), { padding: [20, 20] });
+    }
+
+    function parcelStyle(feature) {
+      const isSelected = feature.properties.candidate_id === selectedCandidateId;
+      return {
+        color: isSelected ? '#ffbe0b' : colors[feature.properties.candidate_type],
+        weight: isSelected ? 4 : 2,
+        fillOpacity: isSelected ? 0.45 : 0.25
+      };
+    }
+
+    function selectFeature(feature) {
+      selectedCandidateId = feature.properties.candidate_id;
+      document.getElementById('detail').innerHTML = detailHtml(feature.properties);
+      layer.setStyle(parcelStyle);
+    }
+
+    function detailHtml(p) {
+      const counterparts = p.counterparts.length
+        ? p.counterparts.map(memberHtml).join('')
+        : '<div class="muted">No counterpart; this is a single-parcel candidate.</div>';
+      const members = p.members.map(memberHtml).join('');
+      return `
+        <strong>${label(p.address)}</strong>
+        <div class="muted">${p.candidate_type} · ${p.candidate_id}</div>
+        <p>
+          <strong>Owner:</strong> ${label(p.owner)}<br>
+          <strong>Livable area:</strong> ${sqft(p.total_livable_area)}<br>
+          <strong>Zoning:</strong> ${label(p.zoning)}<br>
+          <strong>Category:</strong> ${label(p.category_code_description)}<br>
+          <strong>Building:</strong> ${label(p.building_code_description_new)}<br>
+          <strong>Market value:</strong> ${money(p.market_value)}
+        </p>
+        <p>
+          <strong>Candidate total livable:</strong> ${sqft(p.combined_total_livable_area)}<br>
+          <strong>Candidate market value:</strong> ${money(p.combined_market_value)}
+        </p>
+        <h3>Counterpart</h3>
+        ${counterparts}
+        <h3>All parcels in set</h3>
+        ${members}
+      `;
+    }
+
+    function memberHtml(member) {
+      return `
+        <div class="member counterpart">
+          <strong>${label(member.address)}</strong><br>
+          <span class="muted">parcel ${member.parcel_id}</span><br>
+          Owner: ${label(member.owner)}<br>
+          Livable area: ${sqft(member.total_livable_area)}<br>
+          Zoning: ${label(member.zoning)}<br>
+          Category: ${label(member.category_code_description)}<br>
+          Building: ${label(member.building_code_description_new)}
+        </div>
+      `;
+    }
+  </script>
+</body>
+</html>

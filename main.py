@@ -34,6 +34,7 @@ OPA_CACHE_DIR = Path("opa-property-cache")
 OPA_BATCH_SIZE = 200
 OPA_REQUEST_DELAY_SECONDS = 3.0
 OPA_SQL_API_URL = "https://phl.carto.com/api/v2/sql"
+FRONTEND_DIR = Path("frontend")
 
 
 _RAW_COLUMNS = """
@@ -91,6 +92,12 @@ def main() -> None:
         default=OPA_REQUEST_DELAY_SECONDS,
         help="Seconds to wait between uncached OPA API calls",
     )
+    parser.add_argument(
+        "--frontend-dir",
+        type=Path,
+        default=FRONTEND_DIR,
+        help="Directory for generated static map frontend",
+    )
     args = parser.parse_args()
 
     source_files = sorted(Path(".").glob(args.source_glob))
@@ -107,7 +114,7 @@ def main() -> None:
         delay_seconds=args.opa_delay_seconds,
     )
     opa_rows = read_opa_cache_rows(args.opa_cache_dir)
-    rebuild_database(args.db, rows, opa_rows)
+    rebuild_database(args.db, rows, opa_rows, args.frontend_dir)
     print_summary(args.db)
 
 
@@ -236,7 +243,9 @@ def chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
 
 
-def rebuild_database(db_path: Path, rows: list[RawRow], opa_rows: list[OpaRow]) -> None:
+def rebuild_database(
+    db_path: Path, rows: list[RawRow], opa_rows: list[OpaRow], frontend_dir: Path
+) -> None:
     """Destructively rebuild raw and derived candidate tables in DuckDB."""
 
     created_at = datetime.now(UTC).isoformat(timespec="seconds")
@@ -253,6 +262,7 @@ def rebuild_database(db_path: Path, rows: list[RawRow], opa_rows: list[OpaRow]) 
         create_candidate_property_parcels(con)
         create_candidate_residential_livable_area_view(con)
         validate_candidate_tables(con)
+        write_frontend(con, frontend_dir)
     finally:
         con.close()
 
@@ -341,6 +351,8 @@ def create_opa_properties(con: duckdb.DuckDBPyConnection, rows: list[OpaRow]) ->
             sale_price DOUBLE,
             total_area DOUBLE,
             total_livable_area DOUBLE,
+            category_code_description VARCHAR,
+            building_code_description_new VARCHAR,
             raw_opa_json JSON
         )
         """
@@ -350,7 +362,7 @@ def create_opa_properties(con: duckdb.DuckDBPyConnection, rows: list[OpaRow]) ->
 
     con.executemany(
         """
-        INSERT INTO opa_properties VALUES (?, ?, ?, ?, ?, ?, ?, ?::JSON)
+        INSERT INTO opa_properties VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?::JSON)
         """,
         [
             (
@@ -361,6 +373,8 @@ def create_opa_properties(con: duckdb.DuckDBPyConnection, rows: list[OpaRow]) ->
                 row.get("sale_price"),
                 row.get("total_area"),
                 row.get("total_livable_area"),
+                str(row.get("category_code_description") or ""),
+                str(row.get("building_code_description_new") or ""),
                 json.dumps(row, sort_keys=True),
             )
             for row in rows
@@ -403,7 +417,9 @@ def create_residential_properties(con: duckdb.DuckDBPyConnection) -> None:
             o.market_value,
             o.sale_price,
             o.total_area,
-            o.total_livable_area
+            o.total_livable_area,
+            o.category_code_description,
+            o.building_code_description_new
         FROM canonical_properties c
         JOIN opa_properties o
           ON c.opa_account_num = o.parcel_number
@@ -639,6 +655,272 @@ def create_candidate_residential_livable_area_view(
         """
     )
 
+
+
+def write_frontend(con: duckdb.DuckDBPyConnection, frontend_dir: Path) -> None:
+    """Generate a small static Leaflet frontend for reviewing candidate parcels."""
+
+    data_dir = frontend_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    features = build_candidate_parcel_features(con)
+    (data_dir / "candidate-parcels.geojson").write_text(
+        json.dumps({"type": "FeatureCollection", "features": features})
+    )
+    (frontend_dir / "index.html").write_text(FRONTEND_HTML)
+
+
+def build_candidate_parcel_features(con: duckdb.DuckDBPyConnection) -> list[dict[str, Any]]:
+    """Return one GeoJSON feature per parcel in the livable-area candidate view."""
+
+    member_rows = con.execute(
+        """
+        SELECT
+            cp.candidate_id,
+            cpp.parcel_id,
+            cpp.parcel_order,
+            rp.street_address,
+            rp.owner_normalized,
+            rp.total_livable_area,
+            rp.zoning,
+            rp.category_code_description,
+            rp.building_code_description_new
+        FROM candidate_residential_livable_area cp
+        JOIN candidate_property_parcels cpp USING (candidate_id)
+        JOIN residential_properties rp USING (parcel_id)
+        ORDER BY cp.candidate_id, cpp.parcel_order
+        """
+    ).fetchall()
+    members_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    for row in member_rows:
+        candidate_id = row[0]
+        members_by_candidate.setdefault(candidate_id, []).append(
+            {
+                "parcel_id": row[1],
+                "parcel_order": row[2],
+                "address": row[3],
+                "owner": row[4],
+                "total_livable_area": row[5],
+                "zoning": row[6],
+                "category_code_description": row[7],
+                "building_code_description_new": row[8],
+            }
+        )
+
+    feature_rows = con.execute(
+        """
+        SELECT
+            cp.candidate_id,
+            cp.human_id,
+            cp.candidate_type,
+            cp.combined_total_livable_area,
+            cp.combined_market_value,
+            cp.combined_total_area,
+            cpp.parcel_id,
+            cpp.parcel_order,
+            rp.street_address,
+            rp.owner_normalized,
+            rp.total_livable_area,
+            rp.zoning,
+            rp.market_value,
+            rp.category_code_description,
+            rp.building_code_description_new,
+            ST_AsGeoJSON(
+                ST_Transform(rp.geom, rp.working_srid, 'EPSG:4326', true)
+            ) AS geometry_geojson
+        FROM candidate_residential_livable_area cp
+        JOIN candidate_property_parcels cpp USING (candidate_id)
+        JOIN residential_properties rp USING (parcel_id)
+        WHERE rp.geom IS NOT NULL
+        ORDER BY cp.candidate_type, cp.human_id, cpp.parcel_order
+        """
+    ).fetchall()
+
+    features = []
+    for row in feature_rows:
+        candidate_id = row[0]
+        parcel_id = row[6]
+        members = members_by_candidate[candidate_id]
+        counterparts = [member for member in members if member["parcel_id"] != parcel_id]
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": json.loads(row[15]),
+                "properties": {
+                    "candidate_id": candidate_id,
+                    "human_id": row[1],
+                    "candidate_type": row[2],
+                    "combined_total_livable_area": row[3],
+                    "combined_market_value": row[4],
+                    "combined_total_area": row[5],
+                    "parcel_id": parcel_id,
+                    "parcel_order": row[7],
+                    "address": row[8],
+                    "owner": row[9],
+                    "total_livable_area": row[10],
+                    "zoning": row[11],
+                    "market_value": row[12],
+                    "category_code_description": row[13],
+                    "building_code_description_new": row[14],
+                    "members": members,
+                    "counterparts": counterparts,
+                },
+            }
+        )
+    return features
+
+
+FRONTEND_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Twinfarms Candidate Properties</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    body { font-family: system-ui, sans-serif; }
+    .panel {
+      position: absolute; top: 12px; right: 12px; z-index: 1000;
+      width: 360px; max-height: calc(100% - 24px); overflow: auto;
+      background: white; border-radius: 8px; box-shadow: 0 2px 12px #0003;
+      padding: 12px;
+    }
+    .panel h1 { font-size: 18px; margin: 0 0 8px; }
+    .panel h3 { font-size: 14px; margin: 14px 0 6px; }
+    .filters label { display: block; margin: 6px 0; }
+    .muted { color: #666; font-size: 12px; }
+    .detail { border-top: 1px solid #ddd; margin-top: 12px; padding-top: 12px; }
+    .member { border-left: 4px solid #ddd; padding-left: 8px; margin: 8px 0; }
+    .counterpart { border-left-color: #7b2cbf; }
+    .leaflet-popup-content { min-width: 260px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <aside class="panel">
+    <h1>Candidate properties</h1>
+    <div class="muted" id="count">Loading…</div>
+    <div class="filters">
+      <strong>Match type</strong>
+      <label><input type="checkbox" value="hyphen_address" checked> Hyphen address</label>
+      <label><input type="checkbox" value="touching_same_owner" checked> Touching same owner</label>
+      <label><input type="checkbox" value="close_same_owner" checked> Close same owner</label>
+    </div>
+    <div class="detail" id="detail">Click a parcel to inspect it.</div>
+  </aside>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const colors = {
+      hyphen_address: '#2a9d8f',
+      touching_same_owner: '#e76f51',
+      close_same_owner: '#4361ee'
+    };
+    const map = L.map('map').setView([39.952, -75.215], 14);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 20,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    let data;
+    let layer;
+    let selectedCandidateId = null;
+
+    const money = value => value == null ? '—' : '$' + Math.round(value).toLocaleString();
+    const sqft = value => value == null ? '—' : Math.round(value).toLocaleString() + ' sf';
+    const label = value => value || '—';
+
+    fetch('data/candidate-parcels.geojson')
+      .then(response => response.json())
+      .then(json => {
+        data = json;
+        render();
+      });
+
+    document.querySelectorAll('.filters input').forEach(input => {
+      input.addEventListener('change', render);
+    });
+
+    function activeTypes() {
+      return new Set([...document.querySelectorAll('.filters input:checked')].map(input => input.value));
+    }
+
+    function render() {
+      const types = activeTypes();
+      const filtered = {
+        type: 'FeatureCollection',
+        features: data.features.filter(feature => types.has(feature.properties.candidate_type))
+      };
+      if (layer) map.removeLayer(layer);
+      layer = L.geoJSON(filtered, {
+        style: feature => parcelStyle(feature),
+        onEachFeature: (feature, leafletLayer) => {
+          leafletLayer.on('click', () => selectFeature(feature));
+          leafletLayer.bindPopup(feature.properties.address);
+        }
+      }).addTo(map);
+      document.getElementById('count').textContent = `${filtered.features.length} parcels in ${new Set(filtered.features.map(f => f.properties.candidate_id)).size} candidates`;
+      if (filtered.features.length) map.fitBounds(layer.getBounds(), { padding: [20, 20] });
+    }
+
+    function parcelStyle(feature) {
+      const isSelected = feature.properties.candidate_id === selectedCandidateId;
+      return {
+        color: isSelected ? '#ffbe0b' : colors[feature.properties.candidate_type],
+        weight: isSelected ? 4 : 2,
+        fillOpacity: isSelected ? 0.45 : 0.25
+      };
+    }
+
+    function selectFeature(feature) {
+      selectedCandidateId = feature.properties.candidate_id;
+      document.getElementById('detail').innerHTML = detailHtml(feature.properties);
+      layer.setStyle(parcelStyle);
+    }
+
+    function detailHtml(p) {
+      const counterparts = p.counterparts.length
+        ? p.counterparts.map(memberHtml).join('')
+        : '<div class="muted">No counterpart; this is a single-parcel candidate.</div>';
+      const members = p.members.map(memberHtml).join('');
+      return `
+        <strong>${label(p.address)}</strong>
+        <div class="muted">${p.candidate_type} · ${p.candidate_id}</div>
+        <p>
+          <strong>Owner:</strong> ${label(p.owner)}<br>
+          <strong>Livable area:</strong> ${sqft(p.total_livable_area)}<br>
+          <strong>Zoning:</strong> ${label(p.zoning)}<br>
+          <strong>Category:</strong> ${label(p.category_code_description)}<br>
+          <strong>Building:</strong> ${label(p.building_code_description_new)}<br>
+          <strong>Market value:</strong> ${money(p.market_value)}
+        </p>
+        <p>
+          <strong>Candidate total livable:</strong> ${sqft(p.combined_total_livable_area)}<br>
+          <strong>Candidate market value:</strong> ${money(p.combined_market_value)}
+        </p>
+        <h3>Counterpart</h3>
+        ${counterparts}
+        <h3>All parcels in set</h3>
+        ${members}
+      `;
+    }
+
+    function memberHtml(member) {
+      return `
+        <div class="member counterpart">
+          <strong>${label(member.address)}</strong><br>
+          <span class="muted">parcel ${member.parcel_id}</span><br>
+          Owner: ${label(member.owner)}<br>
+          Livable area: ${sqft(member.total_livable_area)}<br>
+          Zoning: ${label(member.zoning)}<br>
+          Category: ${label(member.category_code_description)}<br>
+          Building: ${label(member.building_code_description_new)}
+        </div>
+      `;
+    }
+  </script>
+</body>
+</html>
+"""
 
 def validate_candidate_tables(con: duckdb.DuckDBPyConnection) -> None:
     """Run integrity checks that should be true after each refresh."""
