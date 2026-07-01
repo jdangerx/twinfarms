@@ -34,7 +34,7 @@ OPA_CACHE_DIR = Path("opa-property-cache")
 OPA_BATCH_SIZE = 200
 OPA_REQUEST_DELAY_SECONDS = 3.0
 OPA_SQL_API_URL = "https://phl.carto.com/api/v2/sql"
-FRONTEND_DIR = Path("frontend")
+FRONTEND_DIR = Path(".")
 
 
 _RAW_COLUMNS = """
